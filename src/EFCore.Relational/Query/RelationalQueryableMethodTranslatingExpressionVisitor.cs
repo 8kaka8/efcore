@@ -744,16 +744,49 @@ namespace Microsoft.EntityFrameworkCore.Query
                 var derivedType = entityType.GetDerivedTypes().SingleOrDefault(et => et.ClrType == resultType);
                 if (derivedType != null)
                 {
-                    if (!derivedType.GetRootType().GetIsDiscriminatorMappingComplete()
-                        || !derivedType.GetAllBaseTypesInclusiveAscending()
-                            .All(e => (e == derivedType || e.IsAbstract()) && !HasSiblings(e)))
+                    var discriminatorProperty = entityType.GetDiscriminatorProperty();
+                    if (discriminatorProperty == null)
                     {
                         var selectExpression = (SelectExpression)source.QueryExpression;
                         var concreteEntityTypes = derivedType.GetConcreteDerivedTypesInclusive().ToList();
                         var projectionBindingExpression = (ProjectionBindingExpression)entityShaperExpression.ValueBufferExpression;
+
+                        var projectionMember = projectionBindingExpression.ProjectionMember;
+                        Check.DebugAssert(
+                            new ProjectionMember().Equals(projectionMember),
+                            "Invalid ProjectionMember when processing OfType");
+
                         var entityProjectionExpression = (EntityProjectionExpression)selectExpression.GetMappedProjection(
                             projectionBindingExpression.ProjectionMember);
-                        var discriminatorColumn = entityProjectionExpression.BindProperty(entityType.GetDiscriminatorProperty());
+
+                        var predicate = entityProjectionExpression.DiscriminatorExpressions
+                            .Where(kvp => concreteEntityTypes.Contains(kvp.Key))
+                            .Select(kvp => kvp.Value)
+                            .Aggregate((l, r) => _sqlExpressionFactory.OrElse(l, r));
+
+                        selectExpression.ApplyPredicate(predicate);
+                        selectExpression.ReplaceProjectionMapping(
+                            new Dictionary<ProjectionMember, Expression>
+                            {
+                                { projectionMember, entityProjectionExpression.UpdateEntityType(derivedType) }
+                            });
+                    }
+                    else if (!derivedType.GetRootType().GetIsDiscriminatorMappingComplete()
+                            || !derivedType.GetAllBaseTypesInclusiveAscending()
+                                .All(e => (e == derivedType || e.IsAbstract()) && !HasSiblings(e)))
+                    {
+                        var selectExpression = (SelectExpression)source.QueryExpression;
+                        var concreteEntityTypes = derivedType.GetConcreteDerivedTypesInclusive().ToList();
+                        var projectionBindingExpression = (ProjectionBindingExpression)entityShaperExpression.ValueBufferExpression;
+
+                        var projectionMember = projectionBindingExpression.ProjectionMember;
+                        Check.DebugAssert(
+                            new ProjectionMember().Equals(projectionMember),
+                            "Invalid ProjectionMember when processing OfType");
+
+                        var entityProjectionExpression = (EntityProjectionExpression)selectExpression.GetMappedProjection(
+                            projectionBindingExpression.ProjectionMember);
+                        var discriminatorColumn = entityProjectionExpression.BindProperty(discriminatorProperty);
 
                         var predicate = concreteEntityTypes.Count == 1
                             ? _sqlExpressionFactory.Equal(
@@ -765,19 +798,10 @@ namespace Microsoft.EntityFrameworkCore.Query
                                 negated: false);
 
                         selectExpression.ApplyPredicate(predicate);
-
-                        var projectionMember = projectionBindingExpression.ProjectionMember;
-
-                        Check.DebugAssert(
-                            new ProjectionMember().Equals(projectionMember),
-                            "Invalid ProjectionMember when processing OfType");
-
-                        var entityProjection = (EntityProjectionExpression)selectExpression.GetMappedProjection(projectionMember);
-
                         selectExpression.ReplaceProjectionMapping(
                             new Dictionary<ProjectionMember, Expression>
                             {
-                            { projectionMember, entityProjection.UpdateEntityType(derivedType) }
+                                { projectionMember, entityProjectionExpression.UpdateEntityType(derivedType) }
                             });
                     }
 
@@ -1285,16 +1309,31 @@ namespace Microsoft.EntityFrameworkCore.Query
                 var innerShaper = entityProjectionExpression.BindNavigation(navigation);
                 if (innerShaper == null)
                 {
-                    if (entityType.GetViewOrTableMappings().Single().Table
-                        .GetReferencingRowInternalForeignKeys(foreignKey.PrincipalEntityType)?.Contains(foreignKey) == true)
+                    // If navigation is defined on derived type and entity type is part of TPT then we need to get ITableBase for derived type.
+                    var table = navigation.DeclaringEntityType.BaseType == null
+                        || entityType.GetDiscriminatorProperty() != null
+                        ? navigation.DeclaringEntityType.GetViewOrTableMappings().Single().Table
+                        : navigation.DeclaringEntityType.GetViewOrTableMappings().Select(tm => tm.Table)
+                            .Except(navigation.DeclaringEntityType.BaseType.GetViewOrTableMappings().Select(tm => tm.Table))
+                            .Single();
+                    if (table.GetReferencingRowInternalForeignKeys(foreignKey.PrincipalEntityType)?.Contains(foreignKey) == true)
                     {
-                        // Since we are not going to update table or visit, we always generate propertyExpressions
-                        // We just first column of PK to figure out the base table
+                        // TODO: Update this code to deal with TPT on dependent end
+                        // Mapped to same table
+                        // We get identifying column to figure out tableExpression and nullability of most principal table
                         var identifyingColumn = entityProjectionExpression.BindProperty(entityType.FindPrimaryKey().Properties.First());
+                        // Either principal side is nullable already
+                        // Or navigation is on derived type and principal is TPT then navigation would project nullable PK columns.
+                        // Derived owned navigation does not de-dupe the PK column which for principal is from base table and for dependent on derived table
+                        var principalNullable = identifyingColumn.IsNullable
+                            || (entityType.GetDiscriminatorProperty() == null
+                                && navigation.DeclaringEntityType.IsStrictlyDerivedFrom(entityShaperExpression.EntityType));
+
                         var propertyExpressions = identifyingColumn.Table is TableExpression innerTable
-                            ? GetPropertyExpressionsFromTable(targetEntityType, innerTable, identifyingColumn.IsNullable)
-                            // Pull columns out of inner subquery
-                            : GetPropertyExpressionsFromSubquery(targetEntityType, identifyingColumn, identifyingColumn.IsNullable);
+                            ? GetPropertyExpressionsFromTable(
+                                targetEntityType, table, _selectExpression, innerTable, principalNullable)
+                            // If the principal table is SelectExpression then we may need to populate inner projection
+                            : GetPropertyExpressionsFromSubquery(targetEntityType, table, identifyingColumn, principalNullable);
 
                         innerShaper = new RelationalEntityShaperExpression(
                             targetEntityType, new EntityProjectionExpression(targetEntityType, propertyExpressions), true);
@@ -1323,10 +1362,11 @@ namespace Microsoft.EntityFrameworkCore.Query
                         var joinPredicate = _sqlTranslator.Translate(Expression.Equal(outerKey, innerKey));
                         _selectExpression.AddLeftJoin(innerSelectExpression, joinPredicate);
                         var leftJoinTable = ((LeftJoinExpression)_selectExpression.Tables.Last()).Table;
+                        // TODO: Update this code to pull discriminator expressions from joined table when dependent is TPT
+                        var propertyExpressions = GetPropertyExpressionsFromJoinedTable(targetEntityType, table, leftJoinTable);
+
                         innerShaper = new RelationalEntityShaperExpression(
-                            targetEntityType,
-                            new EntityProjectionExpression(targetEntityType, leftJoinTable, true),
-                            true);
+                            targetEntityType, new EntityProjectionExpression(targetEntityType, propertyExpressions), true);
                     }
 
                     entityProjectionExpression.AddNavigationBinding(navigation, innerShaper);
@@ -1335,13 +1375,19 @@ namespace Microsoft.EntityFrameworkCore.Query
                 return innerShaper;
             }
 
-
-
-            private static IDictionary<IProperty, ColumnExpression> LiftPropertyExpressionsFromSubquery(
-                IDictionary<IProperty, ColumnExpression> propertyExpressions, SelectExpression subquery)
+            private static IDictionary<IProperty, ColumnExpression> GetPropertyExpressionsFromSubquery(
+                IEntityType entityType, ITableBase table, ColumnExpression identifyingColumn, bool nullable)
             {
+                var subquery = (SelectExpression)identifyingColumn.Table;
+                var subqueryIdentifyingColumn = (ColumnExpression)subquery.Projection
+                    .SingleOrDefault(e => string.Equals(e.Alias, identifyingColumn.Name, StringComparison.OrdinalIgnoreCase)).Expression;
+
+                var subqueryPropertyExpressions = subqueryIdentifyingColumn.Table is TableExpression innerTable
+                    ? GetPropertyExpressionsFromTable(entityType, table, subquery, innerTable, nullable)
+                    : GetPropertyExpressionsFromSubquery(entityType, table, subqueryIdentifyingColumn, nullable);
+
                 var newPropertyExpressions = new Dictionary<IProperty, ColumnExpression>();
-                foreach (var item in propertyExpressions)
+                foreach (var item in subqueryPropertyExpressions)
                 {
                     newPropertyExpressions[item.Key] = new ColumnExpression(
                         subquery.Projection[subquery.AddToProjection(item.Value)], subquery);
@@ -1350,28 +1396,49 @@ namespace Microsoft.EntityFrameworkCore.Query
                 return newPropertyExpressions;
             }
 
-            private static IDictionary<IProperty, ColumnExpression> GetPropertyExpressionsFromSubquery(
-                IEntityType entityType, ColumnExpression identifyingColumn, bool nullable)
+            private static IDictionary<IProperty, ColumnExpression> GetPropertyExpressionsFromTable(
+                IEntityType entityType, ITableBase table, SelectExpression selectExpression, TableExpression tableExpression, bool nullable)
             {
-                var subquery = (SelectExpression)identifyingColumn.Table;
-                var subqueryIdentifyingColumn = (ColumnExpression)subquery.Projection
-                    .SingleOrDefault(e => string.Equals(e.Alias, identifyingColumn.Name, StringComparison.OrdinalIgnoreCase)).Expression;
+                if (!string.Equals(tableExpression.Name, table.Name, StringComparison.OrdinalIgnoreCase))
+                {
+                    // Fetch the table for the type which is defininig the navigation since dependent would be in that table
+                    tableExpression = selectExpression.Tables
+                        .Select(t => (t as InnerJoinExpression)?.Table ?? (t as LeftJoinExpression)?.Table ?? t)
+                        .Cast<TableExpression>()
+                        .First(t => string.Equals(t.Name, table.Name, StringComparison.OrdinalIgnoreCase));
+                }
 
-                var subqueryPropertyExpressions = subqueryIdentifyingColumn.Table is TableExpression innerTable
-                    ? GetPropertyExpressionsFromTable(entityType, innerTable, nullable)
-                    : GetPropertyExpressionsFromSubquery(entityType, subqueryIdentifyingColumn, nullable);
+                var propertyExpressions = new Dictionary<IProperty, ColumnExpression>();
+                foreach (var property in entityType
+                    .GetAllBaseTypes().Concat(entityType.GetDerivedTypesInclusive()).SelectMany(EntityTypeExtensions.GetDeclaredProperties))
+                {
+                    var column = table is ITable
+                        ? (IColumnBase)property.GetTableColumnMappings().Where(cm => cm.TableMapping.Table == table
+                            && cm.TableMapping.EntityType == property.DeclaringEntityType).Single().Column
+                        : property.GetViewColumnMappings().Where(cm => cm.TableMapping.Table == table
+                            && cm.TableMapping.EntityType == property.DeclaringEntityType).Single().Column;
 
-                return LiftPropertyExpressionsFromSubquery(subqueryPropertyExpressions, subquery);
+                    propertyExpressions[property] = new ColumnExpression(
+                        property, column, tableExpression, nullable || !property.IsPrimaryKey());
+                }
+
+                return propertyExpressions;
             }
 
-            private static IDictionary<IProperty, ColumnExpression> GetPropertyExpressionsFromTable(
-                IEntityType entityType, TableExpression table, bool nullable)
+            private static IDictionary<IProperty, ColumnExpression> GetPropertyExpressionsFromJoinedTable(
+                IEntityType entityType, ITableBase table, TableExpressionBase tableExpression)
             {
                 var propertyExpressions = new Dictionary<IProperty, ColumnExpression>();
                 foreach (var property in entityType
                     .GetAllBaseTypes().Concat(entityType.GetDerivedTypesInclusive()).SelectMany(EntityTypeExtensions.GetDeclaredProperties))
                 {
-                    propertyExpressions[property] = new ColumnExpression(property, table, nullable || !property.IsPrimaryKey());
+                    var column = table is ITable
+                        ? (IColumnBase)property.GetTableColumnMappings().Where(cm => cm.TableMapping.Table == table
+                            && cm.TableMapping.EntityType == property.DeclaringEntityType).Single().Column
+                        : property.GetViewColumnMappings().Where(cm => cm.TableMapping.Table == table
+                            && cm.TableMapping.EntityType == property.DeclaringEntityType).Single().Column;
+
+                    propertyExpressions[property] = new ColumnExpression(property, column, tableExpression, nullable: true);
                 }
 
                 return propertyExpressions;

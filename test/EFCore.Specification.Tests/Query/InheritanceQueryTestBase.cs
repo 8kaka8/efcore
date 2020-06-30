@@ -431,10 +431,6 @@ namespace Microsoft.EntityFrameworkCore.Query
                 });
         }
 
-        protected virtual void UseTransaction(DatabaseFacade facade, IDbContextTransaction transaction)
-        {
-        }
-
         [ConditionalFact(Skip = "Issue#16298")]
         public virtual void Union_siblings_with_duplicate_property_in_subquery()
         {
@@ -558,6 +554,10 @@ namespace Microsoft.EntityFrameworkCore.Query
         }
 
         protected InheritanceContext CreateContext() => Fixture.CreateContext();
+
+        protected virtual void UseTransaction(DatabaseFacade facade, IDbContextTransaction transaction)
+        {
+        }
 
         protected virtual bool EnforcesFkConstraints => true;
 

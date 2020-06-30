@@ -747,7 +747,25 @@ namespace Microsoft.EntityFrameworkCore.Query
                 if (derivedType != null)
                 {
                     var concreteEntityTypes = derivedType.GetConcreteDerivedTypesInclusive().ToList();
-                    var discriminatorColumn = BindProperty(entityReferenceExpression, entityType.GetDiscriminatorProperty());
+                    var discriminatorProperty = entityType.GetDiscriminatorProperty();
+                    if (discriminatorProperty == null)
+                    {
+                        // TPT
+                        if (entityReferenceExpression.SubqueryEntity != null)
+                        {
+                            throw new NotImplementedException();
+                        }
+
+                        var entityProjection = (EntityProjectionExpression)Visit(
+                            entityReferenceExpression.ParameterEntity.ValueBufferExpression);
+
+                        return entityProjection.DiscriminatorExpressions
+                            .Where(kvp => concreteEntityTypes.Contains(kvp.Key))
+                            .Select(kvp => kvp.Value)
+                            .Aggregate((l, r) => _sqlExpressionFactory.OrElse(l, r));
+                    }
+
+                    var discriminatorColumn = BindProperty(entityReferenceExpression, discriminatorProperty);
 
                     return concreteEntityTypes.Count == 1
                         ? _sqlExpressionFactory.Equal(

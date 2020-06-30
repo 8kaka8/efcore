@@ -23,49 +23,37 @@ namespace Microsoft.EntityFrameworkCore.Query
     /// </summary>
     public class EntityProjectionExpression : Expression
     {
-        private readonly IDictionary<IProperty, ColumnExpression> _propertyExpressionsCache
-            = new Dictionary<IProperty, ColumnExpression>();
-
-        private readonly IDictionary<INavigation, EntityShaperExpression> _navigationExpressionsCache
+        private readonly IDictionary<IProperty, ColumnExpression> _propertyExpressions = new Dictionary<IProperty, ColumnExpression>();
+        private readonly IDictionary<INavigation, EntityShaperExpression> _navigationExpressions
             = new Dictionary<INavigation, EntityShaperExpression>();
-
-        private readonly TableExpressionBase _innerTable;
-        private readonly bool _nullable;
-
-        /// <summary>
-        ///     Creates a new instance of the <see cref="EntityProjectionExpression" /> class.
-        /// </summary>
-        /// <param name="entityType"> The entity type to shape. </param>
-        /// <param name="innerTable"> The table from which entity columns are being projected out. </param>
-        /// <param name="nullable"> A bool value indicating whether this entity instance can be null. </param>
-        public EntityProjectionExpression([NotNull] IEntityType entityType, [NotNull] TableExpressionBase innerTable, bool nullable)
-        {
-            Check.NotNull(entityType, nameof(entityType));
-            Check.NotNull(innerTable, nameof(innerTable));
-
-            EntityType = entityType;
-            _innerTable = innerTable;
-            _nullable = nullable;
-        }
 
         /// <summary>
         ///     Creates a new instance of the <see cref="EntityProjectionExpression" /> class.
         /// </summary>
         /// <param name="entityType"> The entity type to shape. </param>
         /// <param name="propertyExpressions"> A dictionary of column expressions corresponding to properties of the entity type. </param>
-        public EntityProjectionExpression([NotNull] IEntityType entityType, [NotNull] IDictionary<IProperty, ColumnExpression> propertyExpressions)
+        /// <param name="discriminatorExpressions"> A dictionary of <see cref="SqlExpression"/> to discriminator each entity type in hierarchy. </param>
+        public EntityProjectionExpression(
+            [NotNull] IEntityType entityType,
+            [NotNull] IDictionary<IProperty, ColumnExpression> propertyExpressions,
+            [CanBeNull] IReadOnlyDictionary<IEntityType, SqlExpression> discriminatorExpressions = null)
         {
             Check.NotNull(entityType, nameof(entityType));
             Check.NotNull(propertyExpressions, nameof(propertyExpressions));
 
             EntityType = entityType;
-            _propertyExpressionsCache = propertyExpressions;
+            _propertyExpressions = propertyExpressions;
+            DiscriminatorExpressions = discriminatorExpressions;
         }
 
         /// <summary>
         ///     The entity type being projected out.
         /// </summary>
         public virtual IEntityType EntityType { get; }
+        /// <summary>
+        ///     Dictionary of discriminator expressions.
+        /// </summary>
+        public virtual IReadOnlyDictionary<IEntityType, SqlExpression> DiscriminatorExpressions { get; }
         /// <inheritdoc />
         public sealed override ExpressionType NodeType => ExpressionType.Extension;
         /// <inheritdoc />
@@ -76,18 +64,9 @@ namespace Microsoft.EntityFrameworkCore.Query
         {
             Check.NotNull(visitor, nameof(visitor));
 
-            if (_innerTable != null)
-            {
-                var table = (TableExpressionBase)visitor.Visit(_innerTable);
-
-                return table != _innerTable
-                    ? new EntityProjectionExpression(EntityType, table, _nullable)
-                    : this;
-            }
-
             var changed = false;
             var newCache = new Dictionary<IProperty, ColumnExpression>();
-            foreach (var expression in _propertyExpressionsCache)
+            foreach (var expression in _propertyExpressions)
             {
                 var newExpression = (ColumnExpression)visitor.Visit(expression.Value);
                 changed |= newExpression != expression.Value;
@@ -95,8 +74,21 @@ namespace Microsoft.EntityFrameworkCore.Query
                 newCache[expression.Key] = newExpression;
             }
 
+            Dictionary<IEntityType, SqlExpression> newDiscriminators = null;
+            if (DiscriminatorExpressions != null)
+            {
+                newDiscriminators = new Dictionary<IEntityType, SqlExpression>();
+                foreach (var expression in DiscriminatorExpressions)
+                {
+                    var newExpression = (SqlExpression)visitor.Visit(expression.Value);
+                    changed |= newExpression != expression.Value;
+
+                    newDiscriminators[expression.Key] = newExpression;
+                }
+            }
+
             return changed
-                ? new EntityProjectionExpression(EntityType, newCache)
+                ? new EntityProjectionExpression(EntityType, newCache, newDiscriminators)
                 : this;
         }
 
@@ -106,18 +98,13 @@ namespace Microsoft.EntityFrameworkCore.Query
         /// <returns> A new entity projection expression which can project nullable entity. </returns>
         public virtual EntityProjectionExpression MakeNullable()
         {
-            if (_innerTable != null)
-            {
-                return new EntityProjectionExpression(EntityType, _innerTable, nullable: true);
-            }
-
             var newCache = new Dictionary<IProperty, ColumnExpression>();
-            foreach (var expression in _propertyExpressionsCache)
+            foreach (var expression in _propertyExpressions)
             {
                 newCache[expression.Key] = expression.Value.MakeNullable();
             }
 
-            return new EntityProjectionExpression(EntityType, newCache);
+            return new EntityProjectionExpression(EntityType, newCache, DiscriminatorExpressions);
         }
 
         /// <summary>
@@ -129,13 +116,8 @@ namespace Microsoft.EntityFrameworkCore.Query
         {
             Check.NotNull(derivedType, nameof(derivedType));
 
-            if (_innerTable != null)
-            {
-                return new EntityProjectionExpression(derivedType, _innerTable, _nullable);
-            }
-
             var propertyExpressionCache = new Dictionary<IProperty, ColumnExpression>();
-            foreach (var kvp in _propertyExpressionsCache)
+            foreach (var kvp in _propertyExpressions)
             {
                 var property = kvp.Key;
                 if (derivedType.IsAssignableFrom(property.DeclaringEntityType)
@@ -145,7 +127,22 @@ namespace Microsoft.EntityFrameworkCore.Query
                 }
             }
 
-            return new EntityProjectionExpression(derivedType, propertyExpressionCache);
+            Dictionary<IEntityType, SqlExpression> discriminatorExpressions = null;
+            if (DiscriminatorExpressions != null)
+            {
+                discriminatorExpressions = new Dictionary<IEntityType, SqlExpression>();
+                foreach (var kvp in DiscriminatorExpressions)
+                {
+                    var entityType = kvp.Key;
+                    if (derivedType.IsAssignableFrom(entityType)
+                        || entityType.IsAssignableFrom(derivedType))
+                    {
+                        discriminatorExpressions[entityType] = kvp.Value;
+                    }
+                }
+            }
+
+            return new EntityProjectionExpression(derivedType, propertyExpressionCache, discriminatorExpressions);
         }
 
         /// <summary>
@@ -168,13 +165,7 @@ namespace Microsoft.EntityFrameworkCore.Query
                         property.Name));
             }
 
-            if (!_propertyExpressionsCache.TryGetValue(property, out var expression))
-            {
-                expression = new ColumnExpression(property, _innerTable, _nullable);
-                _propertyExpressionsCache[property] = expression;
-            }
-
-            return expression;
+            return _propertyExpressions[property];
         }
 
         /// <summary>
@@ -198,7 +189,7 @@ namespace Microsoft.EntityFrameworkCore.Query
                         navigation.Name));
             }
 
-            _navigationExpressionsCache[navigation] = entityShaper;
+            _navigationExpressions[navigation] = entityShaper;
         }
 
         /// <summary>
@@ -222,7 +213,7 @@ namespace Microsoft.EntityFrameworkCore.Query
                         navigation.Name));
             }
 
-            return _navigationExpressionsCache.TryGetValue(navigation, out var expression)
+            return _navigationExpressions.TryGetValue(navigation, out var expression)
                 ? expression
                 : null;
         }
